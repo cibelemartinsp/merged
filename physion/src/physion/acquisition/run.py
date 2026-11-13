@@ -1,0 +1,508 @@
+import os, json, time, sys, shutil
+import requests # to send https message to open ephys
+import numpy as np
+import multiprocessing
+from PyQt5 import QtCore
+
+from physion.utils.files import get_latest_file
+from physion.acquisition.tools import find_line_props,\
+        check_gui_to_init_metadata, set_filename_and_folder
+from physion.opto import stim as opto_stim
+from physion.ephys.synch import sequence as ephysSynch
+from physion.visual_stim.main import build_stim as build_VisualStim
+from physion.visual_stim.show import init_stimWindows
+
+try:
+    from physion.hardware.NIdaq.main import Acquisition
+except ModuleNotFoundError:
+    def Acquisition(**args):
+        return None
+    # print(' [!!] Problem with the NIdaq module [!!] ')
+
+try:
+   from physion.hardware.Thorlabs.main\
+            import launch_Camera as launch_ImagingCamera
+except ModuleNotFoundError:
+    from physion.hardware.Dummy.camera\
+            import launch_Camera as launch_ImagingCamera
+    
+try:
+    from physion.hardware.FLIRcamera.main\
+            import launch_Camera as launch_FlirCamera
+except ModuleNotFoundError:
+    from physion.hardware.Dummy.camera\
+            import launch_Camera as launch_FlirCamera
+# try:
+#     from physion.hardware.LogitechWebcam.main\
+#             import launch_Camera as launch_WebCam
+# except ModuleNotFoundError:
+#     from physion.hardware.Dummy.camera\
+#             import launch_Camera as launch_WebCam
+
+def init_VisualStim(self):
+
+    movie_folder = \
+        os.path.join(
+            os.path.expanduser('~'),
+            'visualStim-protocols', self.EXPERIMENTERS[\
+                        self.experimenterBox.currentText()\
+                                        ]['folder'], 
+            self.protocolBox.currentText())
+
+    with open(\
+            os.path.join(movie_folder,
+                         'protocol.json'), 'r') as fp:
+        self.protocol = json.load(fp)
+
+    self.protocol['screen'] = self.config['Screen']
+    self.protocol['Rig'] = self.config['Rig']
+
+    if self.onlyDemoButton.isChecked():
+        self.protocol['demo'] = True
+    else:
+        self.protocol['demo'] = False
+
+    # re-building visual-stim object to monitor time course of exp
+    stim = build_VisualStim(self.protocol, 
+            from_file=os.path.join(movie_folder, 
+                                   'visual-stim.npy'))
+
+    # STORE visual-stim.npy & protocol.json
+    shutil.copy2(os.path.join(movie_folder, 'visual-stim.npy'),
+                 self.date_time_folder)
+    print('[ok] visual-stimulation protocol saved as "%s"' %\
+            os.path.join(self.date_time_folder, 'protocol.json'))
+    shutil.copy2(os.path.join(movie_folder, 'protocol.json'),
+                 self.date_time_folder)
+    print('[ok] visual-stimulation time course saved as "%s"' %\
+            os.path.join(self.date_time_folder, 'visual-stim.npy'))
+
+    self.max_time = stim.experiment['time_stop'][-1]+\
+            stim.experiment['time_start'][0]
+
+    Format = 'wmv' if 'win' in sys.platform else 'mp4'
+    if stim.screen['nScreens']==1:
+        stim.movie_files = [\
+            os.path.join(movie_folder, 'movie.%s' % Format)]
+    else:
+        stim.movie_files = [\
+            os.path.join(movie_folder, 'movie-%i.%s' % (s+1,Format))\
+            for s in range(stim.screen['nScreens'])]
+
+    return stim
+
+
+def run(self):
+
+    init_ok = True
+
+    # 1) INSURING THAT AT LEAST ONE MODALITY IS SELECTED
+    # for i, k in enumerate(self.MODALITIES):
+    #     if getattr(self,k+'Button').isChecked():
+    #         init_ok = True
+    # if not init_ok:
+    #     print('------------------------------------------------')
+    #     print('-- [!!] Need to pick at least one modality [!!] --')
+    #     print('------------------------------------------------')
+    #     self.statusBar.showMessage(\
+    #             ' [!!] Need to pick at least one modality [!!] ')
+
+    # 2) INSURING THAT A CONFIG IS SELECTED
+    if self.config is None:
+        init_ok = False
+        print('------------------------------------------------')
+        print('-- [!!] Need to select a configuration first [!!] --')
+        print('------------------------------------------------')
+        self.statusBar.showMessage(\
+                ' [!!] Need to select a configuration first [!!] ')
+
+
+    if init_ok:
+
+        print('')
+        self.runEvent.clear() # off, the run command should turn it on
+
+        # SET DATAFOLDER AND SUB-FOLDERS: acquisition/tools.py
+        #     (creates FaceCamera-imgs, ... if necessary )
+        set_filename_and_folder(self)
+        self.datafolder.set(self.date_time_folder)
+
+        self.metadata = check_gui_to_init_metadata(self)
+        self.metadata['datafolder'] = self.date_time_folder
+        self.filename = os.path.join(self.date_time_folder,
+                                     'metadata.npy')
+        self.current_index = 0
+
+        self.max_time = 30*60 
+        # ... 30min by default, so should be stopped manually
+
+        if self.protocolBox.currentText()!='None':
+            self.statusBar.showMessage(\
+                    '[...] initializing acquisition & stimulation')
+            # ---- init visual stim ---- #
+            self.stim = init_VisualStim(self) # (this also sets "self.max_time")
+            init_stimWindows(self) # creates self.stimWins -> for stim display !
+        else:
+            self.stimWins = None
+            self.statusBar.showMessage('[...] initializing acquisition')
+
+        print('[ok] max_time of NIdaq recording set to: %.2dh:%.2dm:%.2ds' %\
+                (self.max_time/3600, 
+                  (self.max_time%3600)/60,
+                    (self.max_time%60)))
+
+        ################################################
+        ###   build the different signals   ############
+        ################################################
+
+        digital_output_steps, analog_output_funcs = [], []
+        digital_line_labels = self.metadata['NIdaq']['digital-outputs']['line-labels']
+        analog_output_labels = self.metadata['NIdaq']['analog-outputs']['channel-labels'] if\
+                                    (self.metadata['NIdaq']['analog-outputs']['N-channels']>0) else []
+
+        if self.metadata['Neuropixels']:
+            #  -- find channel
+            props = find_line_props(digital_line_labels,
+                                    'ephys-synch-signal')
+            sequence = ephysSynch(self.max_time, freq=props['freq'])
+            digital_output_steps += [{'channel':props['chan'], 'onset':e, 'duration':0.1}\
+                                                    for e in sequence[:-1]]
+
+        if self.metadata['CaImaging']:
+            props = find_line_props(digital_line_labels,
+                                    '2P-start-stop-trigger')
+            
+            digital_output_steps += [\
+                {'channel':props['chan'], 'onset':self.metadata['2P']['onset-delay'], 'duration':0.1},
+                {'channel':props['chan'], 'onset':self.max_time - self.metadata['2P']['offset-advance'], 'duration':0.1}]
+            
+
+        if self.stim is not None:
+            #  means WITH VisualStim -- find channel --> TTL for stim onsets
+            props = find_line_props(digital_line_labels,
+                                    'visual-stim-episode-start')
+            digital_output_steps += [{'channel':props['chan'], 'onset':e, 'duration':0.05}\
+                                        for e in self.stim.experiment['time_start']]
+
+        ################################################################################
+        ##### ---> from here: WHAT IS THIS ?
+        if (len(analog_output_labels)>0) and ('trigger-delay' in analog_output_labels[0]):
+            print('analog output trigger delay ... ')
+            trigger_delay = float(analog_output_labels[0].split('trigger-delay-')[1].split('s')[0])
+            def delayedTrigger(t):
+                array = np.zeros(len(t), dtype=float)
+                array[(t>=trigger_delay) & (t<(trigger_delay+0.5))] = 1.
+                return 5.*array 
+            analog_output_funcs.append(delayedTrigger)
+
+        if (len(analog_output_labels)>1) and ('square-wave-TTL' in analog_output_labels[1]):
+            print('analog output square wave TTL ...')
+            period = 1./2./float(analog_output_labels[1].split('square-wave-TTL-')[1].split('Hz')[0])
+            def squareTTL(t):
+                array = np.zeros(len(t), dtype=float)
+                tt=0
+                while tt<t[-1]:
+                    array[(t>=tt+period) & (t<(tt+2*period))] = 1.
+                    tt+=2*period
+                return 5.*array 
+            analog_output_funcs.append(squareTTL)
+        ##### ---> end: WHAT IS THIS ?           TO BE REMOVED IF NOT USED...
+        ################################################################################
+
+        if 'Opto-stim' in self.protocol:
+
+            digital_output_steps += opto_stim.TTL_signal(self.stim, 
+                                                         self.metadata,
+                                                         self.protocol['Opto-stim'])
+
+        if self.metadata['NIDAQ']:
+
+            if self.onlyDemoButton.isChecked():
+                np.save(os.path.join(self.date_time_folder, 'NIdaq.start.npy'),
+                        time.time()*np.ones(1))
+                np.save(os.path.join(self.date_time_folder, 'NIdaq.npy'),
+                        {'analog':np.random.randn(1,20000),
+                        'digital':np.zeros((2,20000), dtype=bool),
+                        'dt':1e-2})
+
+            else:
+                try:
+                    self.acq = Acquisition(\
+                        # ------------------------
+                        # -- sampling settings
+                        sampling_rate=\
+                            self.metadata['NIdaq']['acquisition-frequency'],
+                        max_time=self.max_time,
+                        # ------------------------
+                        # -- sent outputs
+                        # - analog
+                        analog_output_funcs=analog_output_funcs\
+                              if self.metadata['NIdaq']['analog-outputs']['N-channels']>0 else None,
+                        # - digital
+                        digital_output_port=\
+                            self.metadata['NIdaq']['digital-outputs']['lines'],
+                        digital_output_steps=\
+                            digital_output_steps,
+                        # ------------------------
+                        # -- recorded inputs
+                        # - analog
+                        Nchannel_analog_in=\
+                                self.metadata['NIdaq']['analog-inputs']['N-channels'],
+                        # - digital
+                        digital_input_port=\
+                            self.metadata['NIdaq']['digital-inputs']['lines'],
+                        # ------------------------
+                        # -- data writing:
+                        filename= self.filename.replace('metadata', 'NIdaq'))
+                except BaseException as be:
+                    print(be)
+                    print('\n [!!] PB WITH NI-DAQ [!!] \n')
+                    self.acq = None
+        
+
+        # saving all metadata after full initialization:
+        self.save_experiment(self.metadata) 
+
+        # next launching NI-daq 
+        if self.acq is not None:
+            self.acq.launch()
+            self.t0 = self.acq.t0
+            self.statusBar.showMessage('Stimulation & Acquisition running [...]')
+        else:
+            self.statusBar.showMessage('Stimulation running [...]')
+            self.t0 = time.time()
+
+        self.runEvent.set()
+
+        # we leave a timestamp for the start of the visual-stim
+        np.save(os.path.join(self.date_time_folder, 'visual-stim.start.npy'),
+                time.time() * np.ones(1))
+        # --> and we start playing the video...
+        if self.stimWins is not None:
+            for mediaPlayer in self.mediaPlayers:
+                mediaPlayer.play()
+
+        print('')
+        print(' -> acquisition launched !  ')
+        print('')
+        print('                 running [...]')
+        print('')
+
+        self.run_update() # while loop
+        # ========================
+        # ---- HERE IT RUNS [...]
+        # ========================
+
+        if self.animate_buttons:
+            self.runButton.setEnabled(False)
+            self.stopButton.setEnabled(True)
+
+
+def toggle_FaceCamera_process(self):
+
+    if self.config is None:
+        self.statusBar.showMessage(\
+                ' no config selected -> pick a config first !')
+        self.FaceCameraButton.setChecked(False)
+
+    elif self.FaceCameraButton.isChecked() and\
+                        (self.FaceCamera_process is None):
+        # need to launch it
+        self.statusBar.showMessage(\
+                '  starting FaceCamera stream [...] ')
+        self.show()
+        self.FaceCamera_process =\
+                multiprocessing.Process(target=launch_FlirCamera,
+                        args=(self.runEvent, 
+                              self.quitEvent,
+                              self.datafolder,
+                              'FaceCamera', 0, 
+                              {'frame_rate':\
+                                self.config['FaceCamera']['frame-rate']}))
+        self.FaceCamera_process.start()
+        self.statusBar.showMessage(\
+                '[ok] FaceCamera initialized ! (in 5-6s) ')
+        
+    elif (not self.FaceCameraButton.isChecked()) and\
+            (self.FaceCamera_process is not None):
+        # need to shut it down
+        self.statusBar.showMessage(' FaceCamera stream interupted !')
+        self.FaceCamera_process.terminate()
+        self.FaceCamera_process = None
+
+def toggle_RigCamera_process(self):
+
+    if self.config is None:
+        self.statusBar.showMessage(' no config selected -> pick a config first !')
+        self.RigCameraButton.setChecked(False)
+    elif self.RigCameraButton.isChecked() and (self.RigCamera_process is None):
+        # need to launch it
+        self.statusBar.showMessage('  starting RigCamera stream [...] ')
+        self.show()
+        self.RigCamera_process =\
+                multiprocessing.Process(target=launch_FlirCamera,
+                        args=(self.runEvent, 
+                              self.quitEvent,
+                              self.datafolder,
+                              'RigCamera', 1, 
+                              {'frame_rate':\
+                                self.config['RigCamera']['frame-rate']}))
+        self.RigCamera_process.start()
+        self.statusBar.showMessage(\
+                '[ok] FaceCamera initialized ! (in 5-6s) ')
+        
+    elif (not self.RigCameraButton.isChecked()) and (self.RigCamera_process is not None):
+        # need to shut it down
+        self.statusBar.showMessage(' RigCamera stream interupted !')
+        self.RigCamera_process.terminate()
+        self.RigCamera_process = None
+
+def toggle_ImagingCamera_process(self):
+
+    if self.config is None:
+        self.statusBar.showMessage(' no config selected -> pick a config first !')
+        self.ImagingCameraButton.setChecked(False)
+    elif self.ImagingCameraButton.isChecked() and (self.ImagingCamera_process is None):
+        # need to launch it
+        self.statusBar.showMessage('  starting ImagingCamera stream [...] ')
+        self.show()
+        self.ImagingCamera_process =\
+                multiprocessing.Process(target=launch_ImagingCamera,
+                        args=(self.runEvent, 
+                              self.quitEvent,
+                              self.datafolder,
+                              'ImagingCamera', 
+                              {'frame_rate':\
+                                self.config['ImagingCamera']['frame-rate']}))
+        self.ImagingCamera_process.start()
+        self.statusBar.showMessage(\
+                '[ok] ImagingCamera initialized ! (in 5-6s) ')
+        
+    elif (not self.ImagingCameraButton.isChecked()) and (self.ImagingCamera_process is not None):
+        # need to shut it down
+        self.statusBar.showMessage(' ImagingCamera stream interupted !')
+        self.ImagingCamera_process.terminate()
+        self.ImagingCamera_process = None
+
+def run_update(self):
+
+    # --- monitoring of visual stimulation --- #
+    if self.protocolBox.currentText()!='None':
+
+        t = (time.time()-self.t0)
+        iT = min([\
+                int(t*self.stim.movie_refresh_freq),
+                    len(self.stim.is_interstim)-1])
+
+        if self.stim.is_interstim[iT] and\
+                (self.current_index<self.stim.next_index_table[iT]):
+
+            # we update the counter
+            self.current_index = self.stim.next_index_table[iT]
+
+            # at each interstim, we re-align the stimulus presentation
+            for mediaPlayer in self.mediaPlayers:
+                mediaPlayer.setPosition(int(1e3*t))
+
+            # -*- now we update the stimulation display in the terminal -*-
+            protocol_id = self.stim.experiment['protocol_id'][\
+                                            self.stim.next_index_table[iT]]
+            stim_index = self.stim.experiment['index'][\
+                                            self.stim.next_index_table[iT]]
+
+            if self.metadata['Neuropixels'] and self.onlineBox.isChecked():
+                # we send a message to open-ephys to trigger the online PSTH stim condition
+                requests.put("http://localhost:37497/api/message", 
+                            json={"text":"Prtcl-%i-Stim-%i" % (\
+                                            protocol_id+1,
+                                            stim_index+1)})
+
+            print(' - t=%.2dh:%.2dm:%.2ds:%.2d' % (\
+                    t/3600, (t%3600)/60, (t%60), 100*((t%60)-int(t%60))),
+                  '- Running protocol of index %i/%i' %\
+                        (self.current_index+1, 
+                         len(self.stim.experiment['index'])),
+                  ' -- protocol #%i, stim #%i' % (protocol_id+1, stim_index+1))
+
+    # ----- online visualization here -----
+    if (self.FaceCamera_process is not None) and\
+                    (self.liveFaceButton.isChecked()):
+        image = np.load(get_latest_file(\
+                os.path.join(str(self.datafolder.get()), 'FaceCamera-imgs')))
+        self.pCamImg.setImage(image.T)
+
+    elif (self.RigCamera_process is not None) and\
+                    (self.liveRigButton.isChecked()):
+        image = np.load(get_latest_file(\
+                os.path.join(str(self.datafolder.get()), 'RigCamera-imgs')))
+        self.pCamImg.setImage(image.T)
+
+    elif (self.ImagingCamera_process is not None) and\
+                    (self.liveImagingButton.isChecked()):
+        image = np.load(get_latest_file(\
+                os.path.join(str(self.datafolder.get()), 'ImagingCamera-imgs')))
+        self.pCamImg.setImage(image.T)
+
+    # ----- while loop with qttimer object ----- #
+    if self.runEvent.is_set() and\
+          ((time.time()-self.t0)<self.max_time):
+        # it wasn't stopped & time is not over
+        QtCore.QTimer.singleShot(1, self.run_update)
+
+    else:
+        # we reached the end OR we clicked
+        stop_acquisition(self)
+
+def stop(self):
+    # button-related function, just turning the flag off (true things will happen in run_update)
+    self.stopButton.setEnabled(False)   
+    self.runEvent.clear()
+
+def stop_acquisition(self):
+
+    self.runEvent.clear() # needed to stop other processes ! 
+
+    if self.acq is not None:
+        self.acq.close()
+
+    if self.CaImagingButton.isChecked():
+        self.stopButton.setEnabled(False)   
+        self.send_CaImaging_Stop_signal()
+
+    self.statusBar.showMessage('acquisition/stimulation stopped !')
+    print('\n -> acquisition stopped !  \n')
+
+    if self.stimWins is not None:
+        for stimWin in self.stimWins:
+            stimWin.close()
+
+    if self.animate_buttons:
+        self.runButton.setEnabled(True)
+        self.stopButton.setEnabled(False)
+
+
+
+def send_CaImaging_Stop_signal(self):
+    self.statusBar.showMessage(\
+            'sending stop signal for 2-Photon acq. (>2s)')
+    time.sleep(1.0) # need to wait that the NIdaq process is released to create a new one
+    # stop the Ca imaging recording --> a NIdaq process with a single step
+    props = find_line_props(\
+        self.metadata['NIdaq']['digital-outputs']['line-labels'],
+                            '2P-start-stop-trigger')
+    self.acq = Acquisition(\
+        sampling_rate=\
+            self.metadata['NIdaq']['acquisition-frequency'],
+        max_time=0.5,
+        digital_output_port=\
+            self.metadata['NIdaq']['digital-outputs']['lines'],
+        digital_output_steps=[
+                        {'channel':props['chan'], 
+                            'onset': 0.1, 
+                                'duration':0.1}],
+        digital_input_port=\
+            self.metadata['NIdaq']['digital-inputs']['lines'],
+        filename=None)
+    self.acq.launch()
+    time.sleep(0.5)
+    self.acq.close()

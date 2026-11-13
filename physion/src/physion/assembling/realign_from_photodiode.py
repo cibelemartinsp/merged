@@ -1,0 +1,190 @@
+import numpy as np
+import os, time
+from scipy.signal import argrelextrema
+from scipy.ndimage import gaussian_filter1d
+
+def realign_from_photodiode(signal,
+                            metadata,
+                            sampling_rate=None,
+                            onset_shift=-0.005,
+                            shift_time=0.3, # MODIFY IT HERE IN CASE NEEDED
+                            debug=False, istart_debug=0, n_vis=5,
+                            max_episode=-1,
+                            exclude_episodes=[],
+                            indices_forced=[],
+                            times_forced=[],
+                            durations_forced=[],
+                            verbose=True):
+    """
+    
+
+    - shift_time is to handle the fact that there might be a delay in stopping the protocol 
+    without this, the start of the next one is put as the end of the previous...
+
+    - onset_shift: possibility to shift the onset time by a fixed quantity
+            (N.B. that depends on the smoothing, so onset_shift can be negative to compensate)
+    """
+    success = True
+
+    if max_episode==-1:
+        max_episode = len(metadata['time_duration'])
+
+    # extract parameters
+    if sampling_rate is None:
+        dt = 1./metadata['NIdaq-acquisition-frequency']
+    else:
+        dt = 1/sampling_rate
+    t = np.arange(len(signal))*dt
+    
+    tlim, tnew = [0, t[-1]], 0
+
+    tstart, tshift = metadata['time_start'][0]-1, 0
+    metadata['time_start_realigned'] = []
+    # index (in the protocol) of each realigned episode (episodes can be excluded)
+    metadata['realigned_episode_indices'] = []
+
+    if verbose:
+        print('     -> smoothing photodiode signal [...]')
+
+    # smoothing the signal
+    smooth_signal = np.diff(gaussian_filter1d(np.cumsum(signal), 20)) # integral + smooth + derivative
+    smooth_signal[:1000], smooth_signal[-10:] = smooth_signal[1000], smooth_signal[-1000] # to insure no problem at borders (of the derivative)
+
+    # compute signal boundaries to evaluate threshold crossing of photodiode signal
+    H, bins = np.histogram(smooth_signal, bins=100)
+    baseline = bins[np.argmax(H)+1]
+    threshold = (np.max(smooth_signal)-baseline)/4. # reaching 25% of peak level
+
+    # looping over episodes
+    i=0
+    # (we look for all episodes that could have started before the end of the recording)
+    while (i<max_episode) and (tstart<t[-1]) and success:
+
+        # the next time point above being above threshold
+        cond_thresh = (t[:-2]>tstart+shift_time) & (smooth_signal[1:]>=(baseline+threshold)) & (smooth_signal[:-1]<(baseline+threshold))
+        # print(tstart, i, success)
+
+        if i in indices_forced:
+            iforced = np.argwhere(np.array(indices_forced)==i)[0][0]
+            # possibility to force some indices not to be re-aligned
+            print('forced index %i to start at time %.1f for a duration %.1f' % (i, times_forced[iforced], durations_forced[iforced]))
+            metadata['time_duration'][i] = durations_forced[iforced]
+            metadata['time_start_realigned'].append(times_forced[iforced])
+            metadata['realigned_episode_indices'].append(i)
+            tstart = times_forced[iforced]
+            tshift = 0.5
+
+        elif i in exclude_episodes:
+            # we just skip this episodes:
+            success = True
+
+        elif np.sum(cond_thresh)>0:
+            # success
+            tshift = t[:-2][cond_thresh][0] - tstart - onset_shift
+            metadata['time_start_realigned'].append(tstart+tshift)
+            metadata['realigned_episode_indices'].append(i)
+        else:
+            success = False
+            # we don't do anything, we just increment the episode id
+            print('realignment stopped from episode #%i !' % i)
+        
+
+        if success and debug and ((i>=istart_debug) and (i<istart_debug+n_vis)):
+            import matplotlib.pylab as plt
+            # plot alignment for debugging !
+            cond = (t[:-1]>=tstart+shift_time-5) & (t[:-1]<=tstart+tshift+10)
+            fig, ax = plt.subplots()
+            ax.plot(t[:-1][cond], signal[:-1][cond], label='signal')
+            ax.plot(t[:-1][cond], smooth_signal[cond], label='smoothed')
+            ax.plot((tstart+tshift)*np.ones(2), ax.get_ylim(), 'k:', label='onset')
+            ax.plot(ax.get_xlim(), (baseline+threshold)*np.ones(2), 'k:', label='threshold')
+            ax.plot(ax.get_xlim(), baseline*np.ones(2), 'k:', label='baseline')
+            ax.plot((tstart+tshift+metadata['time_duration'][i])*np.ones(2), ax.get_ylim(), 'k:', label='offset')
+            plt.xlabel('time (s)')
+            plt.ylabel('norm. signals')
+            ax.set_title('ep. #%i' % i)
+            ax.legend(frameon=False)
+            plt.show()
+
+        if success:
+            tstart=tstart+tshift+metadata['time_duration'][i] # update tstart by tshift_observed+duration
+            i+=1
+            
+
+    # transform to numpy array
+    metadata['time_start_realigned'] = np.array(metadata['time_start_realigned'])
+    metadata['realigned_episode_indices'] = np.array(metadata['realigned_episode_indices'], dtype=int)
+    metadata['time_stop_realigned'] = metadata['time_start_realigned']+\
+        np.array(metadata['time_duration'])[metadata['realigned_episode_indices']]
+    
+    # if the protocol is not complete, the last one might be truncated, we remove it !
+    # (not complete = the loop stopped before the last episode, excluded episodes do not count,
+    #       or the recording was stopped during the last episode)
+    if (i<len(metadata['time_start'])) or\
+            ((len(metadata['time_stop_realigned'])>0) and (metadata['time_stop_realigned'][-1]>t[-1])):
+        for key in ['time_start_realigned', 'time_stop_realigned', 'realigned_episode_indices']:
+            metadata[key] = metadata[key][:-1]
+        
+    if verbose:
+        print('    [ok]    --> succesfully realigned')
+        print('              found n=%i episodes over the %i of the protocol '\
+                % (len(metadata['time_start_realigned']), len(metadata['time_start'])))
+            
+    return True, metadata
+
+
+def normalize_signal(x):
+    # just to plot above
+    norm, xmin = 1./(np.max(x)-np.min(x)), np.min(x)
+    return norm*(x-xmin), norm, xmin
+
+if __name__=='__main__':
+
+    import matplotlib.pylab as plt
+
+    import argparse, os
+    parser=argparse.ArgumentParser(description="""
+    Realigning visual stimulation episodes from Photodiode signals
+    """,formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument("datafolder")
+    parser.add_argument('-n', "--n_vis", type=int, default=5)
+    parser.add_argument("--max_episode", type=int, default=-1)
+    parser.add_argument('-id', "--istart_debug", type=int, default=0)
+    parser.add_argument("--smoothing_time", type=float, help='in s', default=20e-3)
+    parser.add_argument('-st', "--shift_time", type=float, help='in s', default=0.3)
+    parser.add_argument("--indices_forced", nargs='*', type=int, default=[])
+    parser.add_argument("--times_forced", nargs='*', type=float, default=[])
+    parser.add_argument("--durations_forced", nargs='*', type=float, default=[])
+    args = parser.parse_args()
+
+    data = np.load(os.path.join(args.datafolder, 'NIdaq.npy'), allow_pickle=True).item()['analog'][0]
+    metadata = np.load(os.path.join(args.datafolder, 'metadata.npy'), allow_pickle=True).item()
+    VisualStim = np.load(os.path.join(args.datafolder, 'visual-stim.npy'), allow_pickle=True).item()
+
+    if 'time_duration' not in VisualStim:
+        VisualStim['time_duration'] = np.array(VisualStim['time_stop'])-np.array(VisualStim['time_start'])
+    for key in VisualStim:
+        metadata[key] = VisualStim[key]
+
+    # plt.plot(data[::1000][:1000])
+    # plt.title('photodiode-signal (subsampled/100)')
+    # plt.show()
+
+    realign_from_photodiode(data, metadata,
+                            max_episode=args.max_episode,
+                            debug=True,
+                            istart_debug=args.istart_debug,
+                            shift_time=args.shift_time,
+                            n_vis=args.n_vis,
+                            indices_not_realigned=args.indices_not_realigned,
+                            verbose=True)
+    
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,82 @@
+[project]
+name = "physion"
+version = "2.0"
+authors = [
+  { name="Yann Zerlaut", email="yann.zerlaut@icm-institute.org" },
+  { name="Mai-An Nguyen", email="mai-an.nguyen@icm-institute.org" },
+  { name="Laura Sofia Gonzalez", email="laura.gonzalez@icm-institute.org" },
+]
+description = "Vision Physiology Software"
+readme = "README.md"
+requires-python = ">=3.9.5"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "numpy",
+    "numba",
+    "scipy",
+    "matplotlib",
+    "scikit-image",
+    "scikit-learn",
+    "natsort",
+    "pynwb",
+    "pandas>=1.4.4",
+    "pyqt5.sip",
+    "pyqtgraph",
+    "pyqtdarktheme",
+    "opencv-python-headless",
+    "opencv-contrib-python-headless",
+    "ffmpeg-python",
+    "pyqt5",
+    "openpyxl",
+    # imported directly (previously only installed through other packages)
+    "h5py",
+    "hdmf",
+    "pillow",
+    "python-dateutil",
+    "requests",
+]
+
+[project.optional-dependencies]
+# electrophysiology: spike sorting, LFP, "Ephys-Analysis" and "CSD-Analysis" notebooks
+ephys = [
+    "open-ephys-python-tools>=1.0",
+    "spikeinterface[full]",
+    "probeinterface",
+    "elephant==1.0.0",
+    "neo==0.14.4",
+]
+# acquisition setups (camera SDKs: see docs/install/acquisition.md)
+acquisition = [
+    "nidaqmx",
+]
+# diffusion-model morphing of natural images (visual_stim/natural_images/diffusion.py)
+diffusion = [
+    "torch",
+    "diffusers",
+    "transformers",
+    "accelerate",
+]
+test = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]  # the other scripts of tests/ are not collected
+
+[tool.setuptools.packages.find]
+where = ["src"]
+[tool.setuptools.package-data]
+"physion.acquisition.protocols" = ["*.json"]
+"physion.acquisition.configs" = ["*.json"]
+"physion.acquisition" = ["DataTable.xlsx"]
+"physion.utils" = ["*.mplstyle"]
+"physion.visual_stim" = ["NI_bank/*.jpg"]
+
+[project.urls]
+"Homepage" = "https://github.com/yzerlaut/physion"
+"Documentation" = "https://github.com/yzerlaut/physion/README.md"
+"Bug Tracker" = "https://github.com/yzerlaut/physion/issues"
+

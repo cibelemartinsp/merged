@@ -1,0 +1,276 @@
+from PyQt5 import QtWidgets, QtCore
+import sys, time, os, pathlib, json, tempfile
+import numpy as np
+import multiprocessing # different processes (cameras, visual stim, ...) are sent on different threads...)
+from ctypes import c_char_p
+import pyqtgraph as pg
+import subprocess
+
+from physion.acquisition.settings import get_config_list
+from physion.utils.files import last_datafolder_in_dayfolder, day_folder
+from physion.utils.paths import FOLDERS
+from physion.visual_stim.screens import SCREENS
+from physion.acquisition.settings import load_settings
+
+from physion.acquisition import MODALITIES, EXPERIMENTERS
+
+def multimodal(self,
+               tab_id=0):
+
+    tab = self.tabs[tab_id]
+    self.animate_buttons = True
+
+    self.cleanup_tab(tab)
+
+    self.config = None
+    self.subject, self.protocol = None, {}
+    self.MODALITIES = MODALITIES
+    self.EXPERIMENTERS = EXPERIMENTERS
+
+    ##########################################
+    ######## Multiprocessing quantities  #####
+    ##########################################
+    # to be used through multiprocessing.Process:
+    self.runEvent = multiprocessing.Event() # to turn on/off recordings 
+    self.runEvent.clear()
+    self.quitEvent = multiprocessing.Event()
+    self.quitEvent.clear()
+    self.manager = multiprocessing.Manager() # to share a str across processes
+    self.datafolder = self.manager.Value(c_char_p,
+            str(tempfile.gettempdir())) # temp folder by default
+
+    ##########################################
+    ######   acquisition states/values  ######
+    ##########################################
+    self.stim, self.acq, self.init = None, None, False,
+    self.screen, self.stop_flag = None, False
+    self.FaceCamera_process = None
+    self.RigCamera_process = None
+    self.ImagingCamera_process = None
+    self.RigView_process = None
+    self.params_window = None
+
+    ##########################################################
+    ####### GUI settings
+    ##########################################################
+
+    # ========================================================
+    #------------------- SIDE PANELS FIRST -------------------
+    # -------------------------------------------------------
+    self.add_side_widget(tab.layout, QtWidgets.QLabel(' '))
+    # -------------------------------------------------------
+    self.add_side_widget(tab.layout,
+            QtWidgets.QLabel('* Recording Modalities *'))
+    for i, k in enumerate(self.MODALITIES):
+        setattr(self,k+'Button', QtWidgets.QPushButton(k, self))
+        getattr(self,k+'Button').setCheckable(True)
+        self.add_side_widget(tab.layout, getattr(self, k+'Button'))
+    self.onlineBox = QtWidgets.QCheckBox('online analysis')
+    self.add_side_widget(tab.layout, self.onlineBox)
+    # self.add_side_widget(tab.layout, QtWidgets.QLabel(' '))
+    # self.add_side_widget(tab.layout, QtWidgets.QLabel(' '))
+
+    self.FaceCameraButton.clicked.connect(self.toggle_FaceCamera_process)
+    self.RigCameraButton.clicked.connect(self.toggle_RigCamera_process)
+    self.ImagingCameraButton.clicked.connect(self.toggle_ImagingCamera_process)
+
+    # -------------------------------------------------------
+    # self.add_side_widget(tab.layout,
+            # QtWidgets.QLabel(' * Monitoring * '))
+    # self.webcamButton = QtWidgets.QPushButton('Webcam', self)
+    # self.webcamButton.setCheckable(True)
+    # self.add_side_widget(tab.layout, self.webcamButton)
+
+    self.add_side_widget(tab.layout, QtWidgets.QLabel(' '))
+    self.add_side_widget(tab.layout,
+            QtWidgets.QLabel(' * Notes * '))
+    self.qmNotes = QtWidgets.QTextEdit(self)
+    self.add_side_widget(tab.layout, self.qmNotes)
+
+    # -------------------------------------------------------
+    self.add_side_widget(tab.layout, QtWidgets.QLabel(' '))
+
+    # self.saveSetB = QtWidgets.QPushButton('save settings', self)
+    # self.saveSetB.clicked.connect(self.save_settings)
+    # self.add_side_widget(tab.layout, self.saveSetB)
+
+    self.buildNWB = QtWidgets.QPushButton('plot NIdaq of last', self)
+    self.buildNWB.clicked.connect(lambda: plot_NIdaq_of_last(self))
+    self.add_side_widget(tab.layout, self.buildNWB)
+
+    # ========================================================
+
+    # ========================================================
+    #------------------- THEN MAIN PANEL   -------------------
+    ip, width = 0, 4
+    tab.layout.addWidget(\
+        QtWidgets.QLabel(40*' '+'** Setup **', self),
+                         ip, self.side_wdgt_length, 
+                         1, int(width/2))
+    tab.layout.addWidget(\
+        QtWidgets.QLabel(40*' '+'** Experimenter **', self),
+                         ip, self.side_wdgt_length+int(width/2), 
+                         1, int(width/2))
+    ip+=1
+    # -
+    self.configBox = QtWidgets.QComboBox(self)
+    self.configBox.activated.connect(self.update_config)
+    tab.layout.addWidget(self.configBox,\
+                         ip, self.side_wdgt_length+1, 
+                         1, int(width/2))
+    self.experimenterBox = QtWidgets.QComboBox(self)
+    self.experimenterBox.addItems(self.EXPERIMENTERS.keys())
+    tab.layout.addWidget(self.experimenterBox,\
+                         ip, self.side_wdgt_length+int(width/2)+1, 
+                         1, int(width/2))
+    self.experimenterBox.activated.connect(self.update_config)
+    ip+=1
+    # -
+    tab.layout.addWidget(\
+        QtWidgets.QLabel(40*' '+'** Subject **', self),
+                         ip, self.side_wdgt_length, 
+                         1, width)
+    ip+=1
+    # -
+    self.subjectBox = QtWidgets.QLineEdit(self)
+    self.subjectBox.setText('demo-Mouse')
+    tab.layout.addWidget(self.subjectBox,\
+                         ip, self.side_wdgt_length+1, 
+                         1, width)
+    ip+=1
+    # -
+    tab.layout.addWidget(\
+        QtWidgets.QLabel(40*' '+'** Stimulation Protocol **'+40*' ', self),
+                         ip, self.side_wdgt_length, 
+                         1, width)
+    ip+=1
+    # -
+    self.protocolBox= QtWidgets.QComboBox(self)
+    # self.protocolBox.activated.connect(self.update_visualStim)
+    tab.layout.addWidget(self.protocolBox,\
+                         ip, self.side_wdgt_length+1, 
+                         1, width)
+    ip+=1
+
+    # image panels layout:
+    self.winImg = pg.GraphicsLayoutWidget()
+    tab.layout.addWidget(self.winImg,
+                         ip, self.side_wdgt_length,
+                         self.nWidgetRow-ip, 
+                         self.nWidgetCol-self.side_wdgt_length)
+    # image choice box
+    tab.layout.addWidget(\
+        QtWidgets.QLabel('  =>  live :   ', self),
+                         ip, self.nWidgetCol-2,
+                         1, 2)
+    ip+=1
+    self.liveFaceButton = QtWidgets.QPushButton('Face')
+    self.liveFaceButton.setCheckable(True)
+    tab.layout.addWidget(self.liveFaceButton,\
+                         ip, self.nWidgetCol-2,
+                         1, 2)
+    ip+=1
+    self.liveRigButton = QtWidgets.QPushButton('Rig')
+    self.liveRigButton.setCheckable(True)
+    tab.layout.addWidget(self.liveRigButton,\
+                         ip, self.nWidgetCol-2,
+                         1, 2)
+    ip+=1
+    self.liveImagingButton = QtWidgets.QPushButton('Imaging')
+    self.liveImagingButton.setCheckable(True)
+    tab.layout.addWidget(self.liveImagingButton,\
+                         ip, self.nWidgetCol-2,
+                         1, 2)
+    ip+=1
+
+    # FaceCamera/RigCamera/Imaging panel
+    self.pFace = self.winImg.addViewBox(lockAspect=True,
+                        invertY=True, border=[1, 1, 1])
+    self.pCamImg = pg.ImageItem(np.ones((10,12))*50)
+    self.pFace.addItem(self.pCamImg)
+
+    # NOW MENU INTERACTION BUTTONS
+    ip, width = 1, 5
+    self.runButton = QtWidgets.QPushButton(' * START *')
+    self.runButton.clicked.connect(self.run)
+    tab.layout.addWidget(self.runButton,
+                         ip, 10, 1, width)
+    ip+=1
+    self.stopButton = QtWidgets.QPushButton(' * Stop *')
+    self.stopButton.clicked.connect(self.stop)
+    tab.layout.addWidget(self.stopButton,
+                         ip, 10, 1, width)
+
+    for button in [self.runButton, self.stopButton]:
+        button.setStyleSheet("font-weight: bold")
+
+    ip+=2
+    self.fovPick= QtWidgets.QLineEdit('FOV : X')
+    tab.layout.addWidget(self.fovPick,
+                         ip, 10, 1, 4)
+    # ip+=1
+    # self.cmdPick= QtWidgets.QLineEdit('cmd (V): 5')
+    # tab.layout.addWidget(self.cmdPick,
+    #                      ip, 10, 1, 4)
+
+    self.refresh_tab(tab)
+
+    # READ CONFIGS
+    get_config_list(self) # first
+    load_settings(self)
+
+    if self.animate_buttons:
+        self.runButton.setEnabled(False)
+        self.stopButton.setEnabled(False)
+
+def plot_NIdaq_of_last(self):
+    # last folder (in the experimenter subfolder)
+    root_data_folder = os.path.join(\
+                os.path.expanduser('~'), 'DATA',
+                    self.EXPERIMENTERS[self.experimenterBox.currentText()]['folder'])
+    folder = last_datafolder_in_dayfolder(\
+                day_folder(root_data_folder))
+    print()
+    print('[ ] loading NIdaq data of recording: ', folder)
+    print()
+    import matplotlib.pylab as plt
+
+    fig, AX = plt.subplots(3, 1, figsize=(10,7))
+    plt.subplots_adjust(left=0.1, bottom=0.1)
+
+    data = np.load(os.path.join(folder, 'NIdaq.npy'),
+                   allow_pickle=True).item()
+    with open(os.path.join(folder, 'metadata.json'), 'r') as f:
+        metadata = json.load(f)
+
+    for i in range(data['analog'].shape[0]):
+        AX[0].plot(data['analog'][i][::10]+5*i)
+
+    for i in range(data['digital'].shape[0]):
+        AX[1].plot(data['digital'][i]+1.1*i)
+    AX[0].set_ylabel('analog (V)')
+    AX[0].set_xlabel('time samples (::10)')
+    AX[1].set_ylabel('digital')
+    AX[1].set_xlabel('time samples')
+
+    from behavior.locomotion import compute_speed
+    if 'A1-2P'in metadata['Rig']:
+        speed = compute_speed(data['digital'][0],
+            acq_freq=float(metadata['NIdaq']['acquisition-frequency']),
+            radius_position_on_disk=metadata['rotating-disk']['radius-position-on-disk-cm'],
+            rotoencoder_value_per_rotation=metadata['rotating-disk']['roto-encoder-value-per-rotation'],
+            empirical=True)
+
+    else:
+        speed = compute_speed(None,
+                             A=data['digital'][1],
+                             B=data['digital'][2],
+                             acq_freq=5e3,
+                             radius_position_on_disk=5.)
+    
+    # HARDCODED - binary signals on channels 1 & 2 
+    # HARDCODED - acq. freq. / position on disk
+    AX[2].plot(speed)
+    AX[2].set_ylabel('speed (a.u.)') 
+
+    plt.show()

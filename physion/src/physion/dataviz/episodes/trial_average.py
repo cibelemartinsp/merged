@@ -1,0 +1,242 @@
+# thgeneral modules
+import pynwb, os, sys, pathlib, itertools
+import numpy as np
+import matplotlib.pylab as plt
+from scipy.ndimage import gaussian_filter1d
+
+# custom modules
+import physion.utils.plot_tools as pt
+from physion.analysis import tools
+from physion.dataviz.raw import format_key_value
+from physion.analysis.episodes import trial_statistics
+from . import common
+
+### ---------------------------------
+###  -- Trial Average response  --
+### ---------------------------------
+
+
+def plot(episodes,
+           # episodes props
+           quantity='running', index=None,
+           smoothing=0,
+           condition=None,
+           COL_CONDS=None, column_keys=[], column_key='',
+           ROW_CONDS=None, row_keys=[], row_key='',
+           COLOR_CONDS = None, color_keys=[], color_key='',
+           Xbar=0., Xbar_label='',
+           Ybar=0., Ybar_label='',
+           with_std=True, 
+           with_std_over_rois=False,
+           with_screen_inset=False,
+           screen_inset=[.75, .9, .35, .25],
+           with_stim=True,
+           with_axis=False,
+           with_stat_test=False, 
+           stat_test_props=dict(interval_pre=[-1,0],
+                                interval_post=[1,2],
+                                test='wilcoxon',
+                                sign='positive'),
+           with_annotation=False,
+           color=None,
+           label='',
+           ylim=None, xlim=None,
+           fig=None, AX=None, figsize=(5,3),
+           no_set=True, verbose=False):
+    """
+
+    "norm" can be either:
+        - "Zscore-per-roi"
+        - "minmax-per-roi"
+    """
+
+    condition, COL_CONDS, ROW_CONDS,\
+            with_screen_inset, fig, AX, no_set = \
+                    common.prepare_panels(episodes,
+                            condition,
+                            COL_CONDS, column_keys, column_key,
+                            ROW_CONDS, row_keys, row_key,
+                            with_screen_inset,
+                            fig, AX, figsize)
+    COLOR_CONDS, COLORS = common.prepare_colors(episodes,\
+        COLOR_CONDS, color_keys, color_key, color)
+
+    episodes.ylim = [np.inf, -np.inf]
+
+    for irow, row_cond in enumerate(ROW_CONDS):
+        for icol, col_cond in enumerate(COL_CONDS):
+            for icolor, color_cond in enumerate(COLOR_CONDS):
+
+                cond = np.array(condition & col_cond & row_cond & color_cond)
+                avg_dim = 'episodes' if with_std_over_rois else 'ROIs'  #check
+
+                response = episodes.get_response2D(\
+                                quantity=quantity,
+                                episode_cond=cond,
+                                index=index,
+                                averaging_dimension=avg_dim)
+
+                my = response.mean(axis=0) # mean response
+
+                if smoothing>0:
+                    my = gaussian_filter1d(my, smoothing)
+
+                if with_std:
+                    sy = response.std(axis=0)
+                    pt.plot(episodes.t, my, sy=sy,
+                            ax=AX[irow][icol], color=COLORS[icolor], lw=1)
+                    episodes.ylim = [min([episodes.ylim[0], np.min(my-sy)]),
+                                 max([episodes.ylim[1], np.max(my+sy)])]
+                else:
+                    AX[irow][icol].plot(episodes.t, my,
+                                        color=COLORS[icolor], lw=1)
+                    episodes.ylim = [min([episodes.ylim[0], np.min(my)]),
+                                 max([episodes.ylim[1], np.max(my)])]
+
+                if not with_axis:
+                    AX[irow][icol].axis('off')
+
+                if with_screen_inset:
+
+                    inset = pt.inset(AX[irow][icol],
+                                     screen_inset)
+
+                    istim = np.flatnonzero(cond)[0] # first episode with that condition
+                    episodes.plot_stim_picture(istim, 
+                                               ax=inset)
+
+                if with_annotation:
+
+                    # column label
+                    if (len(COL_CONDS)>1) and (irow==0) and (icolor==0):
+                        s = ''
+                        for i, key in enumerate(episodes.varied_parameters.keys()):
+                            if (key==column_key) or (key in column_keys):
+                                s+=format_key_value(key, getattr(episodes, key)[cond][0])+',' # should have a unique value
+                        # ge.annotate(AX[irow][icol], s, (1, 1), ha='right', va='bottom', size='small')
+                        AX[irow][icol].annotate(s[:-1], (0.5, 1),
+                                ha='center', va='bottom', size='small', xycoords='axes fraction')
+
+                    # row label
+                    if (len(ROW_CONDS)>1) and (icol==0) and (icolor==0):
+                        s = ''
+                        for i, key in enumerate(episodes.varied_parameters.keys()):
+                            if (key==row_key) or (key in row_keys):
+                                try:
+                                    s+=format_key_value(key, 
+                                        getattr(episodes, key)[cond][0])+', ' # should have a unique value
+                                except IndexError:
+                                    pass
+
+                        AX[irow][icol].annotate(s[:-2], (0, 0),
+                            ha='right', va='bottom',
+                            rotation=90, size='small',
+                            xycoords='axes fraction')
+
+                    # n per cond
+                    AX[irow][icol].annotate(' n=%i\n trials'%np.sum(cond)+2*'\n'*icolor,
+                                (.99,0), color=COLORS[icolor], size='xx-small',
+                                ha='left', va='bottom', xycoords='axes fraction')
+
+                    # color label
+                    if (len(COLOR_CONDS)>1) and (irow==0) and (icol==0):
+                        s = ''
+                        for i, key in enumerate(episodes.varied_parameters.keys()):
+                            if (key==color_key) or (key in color_keys):
+                                s+=20*' '+icolor*18*' '+format_key_value(key, getattr(episodes, key)[cond][0])
+                                AX[0][0].annotate(s+'  '+icolor*'\n', (1,0), color=COLORS[icolor],
+                                        ha='right', va='bottom', size='small', xycoords='figure fraction')
+
+    if xlim is None:
+        episodes.xlim = [episodes.t[0], episodes.t[-1]]
+    else:
+        episodes.xlim = xlim
+
+    if ylim is not None:
+        episodes.ylim = ylim
+
+    if with_stat_test:
+        for irow, row_cond in enumerate(ROW_CONDS):
+            for icol, col_cond in enumerate(COL_CONDS):
+                for icolor, color_cond in enumerate(COLOR_CONDS):
+
+                    cond = np.array(condition & col_cond & row_cond & color_cond)#[:response.shape[0]]
+                    results = trial_statistics.stat_test_for_evoked_responses(episodes,
+                                                                              episode_cond=cond,
+                                                                              response_args=dict(quantity=quantity, index=index),
+                                                                              **stat_test_props)
+
+                    ps, size = results.pval_annot()
+                    AX[irow][icol].annotate(icolor*'\n'+ps, ((stat_test_props['interval_post'][0]+stat_test_props['interval_pre'][1])/2.,
+                                                             episodes.ylim[0]), va='top', ha='center', size=size-1, xycoords='data', color=COLORS[icolor])
+                    AX[irow][icol].plot(stat_test_props['interval_pre'], episodes.ylim[0]*np.ones(2), 'k-', lw=1)
+                    AX[irow][icol].plot(stat_test_props['interval_post'], episodes.ylim[0]*np.ones(2), 'k-', lw=1)
+
+    for irow, row_cond in enumerate(ROW_CONDS):
+        for icol, col_cond in enumerate(COL_CONDS):
+            if not no_set:
+                AX[irow][icol].set_ylim(ylim)
+                AX[irow][icol].set_xlim(xlim)
+
+            if with_stim:
+                AX[irow][icol].fill_between([0, np.mean(episodes.time_duration)],
+                                    episodes.ylim[0]*np.ones(2), episodes.ylim[1]*np.ones(2),
+                                    color='grey', alpha=.2, lw=0)
+
+    if not with_axis and not no_set:
+        pt.draw_bar_scales(AX[0][0],
+                           Xbar=Xbar, Xbar_label=Xbar_label,
+                           Ybar=Ybar,  Ybar_label=Ybar_label,
+                           Xbar_fraction=0.1, Xbar_label_format='%.1f',
+                           Ybar_fraction=0.2, Ybar_label_format='%.1f',
+                           loc='top-left')
+
+    if label!='':
+        AX[0][0].annotate(label, (0,0), color=color,
+                ha='left', va='bottom', xycoords='figure fraction')
+
+    # if with_annotation:
+        # S = ''
+        # if hasattr(episodes, 'rawFluo') or hasattr(episodes, 'dFoF') or hasattr(episodes, 'neuropil'):
+            # if index is not None:
+                # S+='roi #%i' % index
+            # elif roiIndices in ['sum', 'mean', 'all']:
+                # S+='n=%i rois' % len(episodes.data.valid_roiIndices)
+            # else:
+                # S+='n=%i rois' % len(roiIndices)
+        # # for i, key in enumerate(episodes.varied_parameters.keys()):
+        # #     if 'single-value' in getattr(episodes, '%s_plot' % key).currentText():
+        # #         S += ', %s=%.2f' % (key, getattr(episodes, '%s_values' % key).currentText())
+        # AX[0][0].annotate(S, (0,0), color='k', ha='left', va='bottom', size='small',
+                # xycoords='figure fraction')
+
+    return fig, AX
+
+
+if __name__=='__main__':
+
+    import argparse
+
+    parser=argparse.ArgumentParser()
+    parser.add_argument("datafile", type=str)
+    parser.add_argument('-pid', "--protocol_id", type=int, default=0)
+
+    args = parser.parse_args()
+
+    if os.path.isfile(args.datafile):
+
+        quantity, episodes = common.test_data(args)
+
+        keys = list(episodes.varied_parameters.keys())
+        plot(episodes,
+             quantity=quantity,
+             column_key=keys[0] if len(keys)>0 else None,
+             row_key=keys[1] if len(keys)>1 else '',
+             color_key=keys[2] if len(keys)>2 else '',
+             with_screen_inset=True)
+        pt.plt.show()
+
+    else:
+        print(' Need to provide a valid NWB file')
+
+

@@ -1,0 +1,142 @@
+"""
+Some presets for our recording conditions
+"""
+
+presets = {\
+        "sourcery-thy1-Taddy":{\
+            "registration":{
+                "nimg_init": 2000,
+                "maxregshift": 0.15,
+                "nonrigid":False,
+                "batch_size":200,
+            },
+            "detection":{
+                "algorithm": "sourcery",
+                "highpass_time":300,
+                "denoise":False,
+                "sourcery_settings":{\
+                    "connected":True,
+                    "max_iterations":20,
+                    "smooth_masks":False,
+                    },
+                "threshold_scaling":1.0,
+            }
+        },
+        "cellpose-Interneurons":{\
+            "registration":{
+                "nimg_init": 2000,
+                "maxregshift": 0.15,
+                "nonrigid":False,
+                "batch_size":200,
+            },
+            "detection":{
+                "algorithm": "cellpose",
+                "denoise":False,
+                "cellpose_settings":{\
+                    "connected":True,
+                    },
+                "threshold_scaling":1.0,
+            }
+        },
+        "hsyn-pyramidal":{\
+                           # functional detection
+                           "sig_baseline":10.0,
+                           'smooth_sigma':1.15,
+                           'smooth_sigma_time':0,
+                           'snr_thresh':1.2,
+                           'soma_crop':True,
+                           'sparse_mode':False,
+                           'spatial_hp_cp':0,
+                           'spatial_hp_detect':25,
+                           'spatial_hp_reg':42,
+                           'spatial_taper':40,
+                           'spatscale_pix':12,
+                           'subpixel':10,
+                           'threshold_scaling':0.0,
+                           "high_pass":300},\
+                           # (ROI diameter from the "cell size" box of the UI)
+        "hsyn-Ventricle-inj":{\
+                           # registration
+                           "nonrigid": False,
+                           # functional detection
+                           "sparse_mode":True,
+                           "allow_overlap":False,
+                           "denoise":0,
+                           "connected":True,
+                           "threshold_scaling":1.0,
+                           "high_pass":300,
+                           "spatial_hp_detect":25.0,
+                           "spatial_scale":0, # no pre-shape
+                           # neuropil
+                           "inner_neuropil_radius": 2,
+                           "min_neuropil_pixels": 350, 
+                           "flow_threshold": 1.5},\
+        "SomasOnly-zoomed":{\
+                           # registration
+                           "nonrigid": False,
+                           # detection
+                           "allow_overlap":True,
+                           "connected":True,
+                           # neuropil
+                           "inner_neuropil_radius": 2,
+                           "min_neuropil_pixels": 100, 
+                           # cellpose
+                            "spatial_hp_cp":0, # high-pass
+                           "cell_diameter":20,
+                           "anatomical_only":2,
+                           "flow_threshold": 0.1,
+                           "cellprob_threshold": -2.0},\
+        "Interneurons":{\
+                       "nonrigid": True,
+                       "allow_overlap":False,
+                       "connected":True,
+                       # cellpose
+                       "cell_diameter":20,
+                       "anatomical_only":2,
+                       "flow_threshold": 0.1,
+                       "cellprob_threshold": 0.8},
+
+        "hsyn-Cibele":{\
+                    # functional detection
+                    "sig_baseline":10.0,
+                    'smooth_sigma':1.15,
+                    'smooth_sigma_time':0,
+                    'snr_thresh':1.2,
+                    'soma_crop':True,
+                    'sparse_mode':False,
+                    'spatial_hp_cp':0,
+                    'spatial_hp_detect':25,
+                    'spatial_hp_reg':42,
+                    'spatial_taper':40,
+                    'spatscale_pix':12,
+                    'subpixel':10,
+                    'threshold_scaling':0.0,
+                    "high_pass":300},\
+        "Test Pyramidal 3":{\
+                    "frames_include":10,
+                    "registration":{
+                        "nonrigid":False
+                    }, 
+                    "detection":{
+                        "sparse_mode":False,
+                        "denoise":True,
+                        "spatial_scale":0,
+                        "allow_overlap":True,
+                        "max_overlap":0.5,
+                        "connected":True,
+                        "threshold_scaling":0.5,
+                        "algorithm": "sourcery",
+                        "sourcery_settings":{\
+                            "threshold_scalling":0.5,
+                            "diameter":10,
+                            "connected":True,
+                            "max_iterations":20,
+                            "smooth_masks":False,
+                            },
+                    }
+                },
+}
+
+if __name__=='__main__':
+    for key in presets:
+        print('  - ', key)
